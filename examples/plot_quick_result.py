@@ -6,7 +6,7 @@ from plotly.subplots import make_subplots
 
 
 EXAMPLES_DIR = Path(__file__).resolve().parent
-MLRUNS_DIR = EXAMPLES_DIR / "mlruns"
+MLRUNS_DIR = EXAMPLES_DIR.parent / "mlruns"
 OUTPUT_PATH = EXAMPLES_DIR / "output" / "lightgbm_quick_report.html"
 
 
