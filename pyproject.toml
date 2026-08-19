@@ -106,6 +106,9 @@ client = [
   "python-socketio<6",
   "tables",
 ]
+questdb = [
+  "psycopg[binary]>=3.2",
+]
 
 # In the process of releasing a new version, when checking the manylinux package with twine, an error is reported:
 # InvalidDistribution: Invalid distribution metadata: unrecognized or malformed field 'license-file'
