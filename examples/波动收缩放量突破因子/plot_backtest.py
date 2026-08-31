@@ -96,7 +96,7 @@ def parse_args() -> argparse.Namespace:
         "--min-entry-close-position",
         type=float,
         default=0.6,
-        help="Minimum close position in the entry candle range",
+        help="Minimum close position in the confirmation candle range",
     )
     parser.add_argument("--context-bars", type=int, default=30)
     parser.add_argument("--detail-trades", type=int, default=30)
@@ -1060,7 +1060,10 @@ def write_outputs(
         f"单边手续费 {float(metrics['fee_rate_per_side']):.2%}，单边滑点 "
         f"{float(metrics['slippage_rate_per_side']):.2%}，双边盈亏平衡约 "
         f"{break_even:.2%}；实际持仓中位数 {float(metrics['median_holding_bars']):.1f} 分钟，"
-        f"最长 {int(metrics['max_holding_bars']):,} 分钟。"
+        f"最长 {int(metrics['max_holding_bars']):,} 分钟；确认柱过滤：上影线/振幅 "
+        f"≤ {float(metrics['max_entry_upper_wick_ratio']):.0%}，收盘位置 "
+        f"≥ {float(metrics['min_entry_close_position']):.0%}；"
+        f"拒绝 {int(metrics['entry_confirmation_rejected']):,} 个信号。"
     )
     report_path = output_dir / REPORT_NAME
     html = f"""<!doctype html>
