@@ -172,6 +172,19 @@ python examples/plot_binance_trades.py \
   --output-dir .qlib/experiments/binance_btc_usdt_1m_h60_be_min_edge0_20260830
 ```
 
+生成 15/60 分钟模型和因子实验的对比总览：
+
+```bash
+python examples/compare_binance_experiments.py \
+  --output-dir .qlib/experiments/binance_experiment_comparison
+```
+
+输出包含净值与回撤曲线、收益/交易数/多头暴露对比、模型预测幅度与成本门槛，
+以及四组实验的明细表：
+
+- `binance_experiment_comparison.html`：交互式对比页面
+- `binance_experiment_comparison.json`：页面使用的结构化指标
+
 本次实际 h60 运行结果：训练集 `1,051,139` 条、验证集 `129,539` 条、测试集
 `217,777` 条；训练和验证末端各 purge `61` 个跨界标签。LightGBM 最佳迭代为 `1`，
 测试集方向准确率约 `50.11%`，预测均值约 `0.511 bp`，仍低于约 `10.005 bp` 的完整

@@ -23,6 +23,49 @@ REPORT_NAME = "squeeze_breakout_backtest.html"
 TRADES_NAME = "squeeze_breakout_trades.csv"
 EQUITY_NAME = "squeeze_breakout_equity.csv"
 METRICS_NAME = "squeeze_breakout_metrics.json"
+REJECTIONS_NAME = "squeeze_breakout_rejections.csv"
+REJECTION_COLUMNS = [
+    "signal_row",
+    "confirmation_row",
+    "entry_row",
+    "signal_time",
+    "confirmation_time",
+    "entry_time",
+    "entry_price",
+    "confirmation_price",
+    "confirmation_upper_wick_ratio",
+    "confirmation_close_position",
+    "breakout_level",
+    "reason",
+]
+TRADE_COLUMNS = [
+    "signal_row",
+    "confirmation_row",
+    "entry_row",
+    "exit_row",
+    "signal_time",
+    "confirmation_time",
+    "entry_time",
+    "confirmation_price",
+    "exit_time",
+    "entry_price",
+    "exit_price",
+    "gross_return",
+    "net_return",
+    "cost_drag",
+    "equity_before",
+    "equity",
+    "holding_bars",
+    "confirmation_upper_wick_ratio",
+    "confirmation_close_position",
+    "score",
+    "compression_ratio",
+    "volume_ratio",
+    "breakout_strength",
+    "close_position",
+    "mfe",
+    "mae",
+]
 FONT_FAMILY = '"Microsoft YaHei UI", "Noto Sans SC", sans-serif'
 COLORS = {
     "strategy": "#147d64",
@@ -43,6 +86,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--horizon-bars", type=int, default=15)
     parser.add_argument("--fee-rate", type=float, default=0.0004)
     parser.add_argument("--slippage-rate", type=float, default=0.0001)
+    parser.add_argument(
+        "--max-entry-upper-wick-ratio",
+        type=float,
+        default=0.4,
+        help="Maximum upper-wick/range ratio allowed on the confirmation candle",
+    )
+    parser.add_argument(
+        "--min-entry-close-position",
+        type=float,
+        default=0.6,
+        help="Minimum close position in the entry candle range",
+    )
     parser.add_argument("--context-bars", type=int, default=30)
     parser.add_argument("--detail-trades", type=int, default=30)
     return parser.parse_args()
@@ -65,7 +120,9 @@ def select_non_overlapping_trades(
     horizon_bars: int,
     fee_rate: float,
     slippage_rate: float,
-) -> tuple[pd.DataFrame, int]:
+    max_entry_upper_wick_ratio: float,
+    min_entry_close_position: float,
+) -> tuple[pd.DataFrame, int, int, int, int, pd.DataFrame]:
     feature_times = data.loc[features.index, "datetime"]
     candidate_mask = (
         feature_times.between(start_time, end_time)
@@ -73,20 +130,71 @@ def select_non_overlapping_trades(
     )
     candidate_rows = features.index[candidate_mask]
     last_test_row = int(data.index[data["datetime"] <= end_time][-1])
+    candle_range = (data["high"] - data["low"]).replace(0, np.nan)
+    entry_close_position = (data["close"] - data["low"]) / candle_range
+    entry_upper_wick_ratio = (
+        data["high"] - data[["open", "close"]].max(axis=1)
+    ) / candle_range
+    prior_high_20 = data["high"].rolling(20).max().shift(1)
     entry_multiplier = (1 + slippage_rate) * (1 + fee_rate)
     exit_multiplier = (1 - slippage_rate) * (1 - fee_rate)
     cash = 1.0
     last_exit_row = -1
+    entry_confirmation_rejected = 0
+    incomplete_horizon_signals = 0
+    overlapping_signals_skipped = 0
     trade_rows: list[dict[str, object]] = []
+    rejection_rows: list[dict[str, object]] = []
 
     for signal_row in candidate_rows:
         signal_row = int(signal_row)
-        entry_row = signal_row + 1
-        exit_row = signal_row + horizon_bars + 1
-        if exit_row > last_test_row or entry_row <= last_exit_row:
+        confirmation_row = signal_row + 1
+        entry_row = signal_row + 2
+        exit_row = signal_row + horizon_bars + 2
+        if exit_row > last_test_row:
+            incomplete_horizon_signals += 1
+            continue
+        if entry_row <= last_exit_row:
+            overlapping_signals_skipped += 1
             continue
 
-        entry_price = float(data.at[entry_row, "close"])
+        breakout_level = prior_high_20.at[signal_row]
+        rejection_reasons: list[str] = []
+        if pd.isna(entry_upper_wick_ratio.at[confirmation_row]):
+            rejection_reasons.append("确认 K 线无有效波动范围")
+        elif entry_upper_wick_ratio.at[confirmation_row] > max_entry_upper_wick_ratio:
+            rejection_reasons.append("确认 K 线上影线过长")
+        if pd.isna(entry_close_position.at[confirmation_row]):
+            rejection_reasons.append("确认 K 线收盘位置无效")
+        elif entry_close_position.at[confirmation_row] < min_entry_close_position:
+            rejection_reasons.append("确认 K 线收盘位置过低")
+        if pd.notna(breakout_level) and data.at[confirmation_row, "close"] < breakout_level:
+            rejection_reasons.append("确认时收盘跌回突破位下方")
+        if rejection_reasons:
+            entry_confirmation_rejected += 1
+            rejection_rows.append(
+                {
+                    "signal_row": signal_row,
+                    "confirmation_row": confirmation_row,
+                    "entry_row": entry_row,
+                    "signal_time": data.at[signal_row, "datetime"],
+                    "confirmation_time": data.at[confirmation_row, "datetime"],
+                    "entry_time": data.at[entry_row, "datetime"],
+                    "entry_price": float(data.at[entry_row, "open"]),
+                    "confirmation_price": float(data.at[confirmation_row, "close"]),
+                    "confirmation_upper_wick_ratio": float(
+                        entry_upper_wick_ratio.at[confirmation_row]
+                    ),
+                    "confirmation_close_position": float(
+                        entry_close_position.at[confirmation_row]
+                    ),
+                    "breakout_level": float(breakout_level) if pd.notna(breakout_level) else np.nan,
+                    "reason": "；".join(rejection_reasons),
+                }
+            )
+            continue
+
+        entry_price = float(data.at[entry_row, "open"])
         exit_price = float(data.at[exit_row, "close"])
         equity_before = cash
         units = equity_before / (entry_price * entry_multiplier)
@@ -98,10 +206,13 @@ def select_non_overlapping_trades(
         trade_rows.append(
             {
                 "signal_row": signal_row,
+                "confirmation_row": confirmation_row,
                 "entry_row": entry_row,
                 "exit_row": exit_row,
                 "signal_time": data.at[signal_row, "datetime"],
+                "confirmation_time": data.at[confirmation_row, "datetime"],
                 "entry_time": data.at[entry_row, "datetime"],
+                "confirmation_price": float(data.at[confirmation_row, "close"]),
                 "exit_time": data.at[exit_row, "datetime"],
                 "entry_price": entry_price,
                 "exit_price": exit_price,
@@ -111,6 +222,12 @@ def select_non_overlapping_trades(
                 "equity_before": equity_before,
                 "equity": cash,
                 "holding_bars": horizon_bars,
+                "confirmation_upper_wick_ratio": float(
+                    entry_upper_wick_ratio.at[confirmation_row]
+                ),
+                "confirmation_close_position": float(
+                    entry_close_position.at[confirmation_row]
+                ),
                 "score": float(features.at[signal_row, "squeeze_breakout_score"]),
                 "compression_ratio": float(
                     features.at[signal_row, "volatility_compression_20_60"]
@@ -124,7 +241,14 @@ def select_non_overlapping_trades(
         )
         last_exit_row = exit_row
 
-    return pd.DataFrame(trade_rows), int(len(candidate_rows))
+    return (
+        pd.DataFrame(trade_rows, columns=TRADE_COLUMNS),
+        int(len(candidate_rows)),
+        incomplete_horizon_signals,
+        entry_confirmation_rejected,
+        overlapping_signals_skipped,
+        pd.DataFrame(rejection_rows, columns=REJECTION_COLUMNS),
+    )
 
 
 def build_equity_curve(
@@ -180,9 +304,14 @@ def calculate_metrics(
     curve: pd.DataFrame,
     trades: pd.DataFrame,
     candidate_signals: int,
+    incomplete_horizon_signals: int,
+    entry_confirmation_rejected: int,
+    overlapping_signals_skipped: int,
     fee_rate: float,
     slippage_rate: float,
     horizon_bars: int,
+    max_entry_upper_wick_ratio: float,
+    min_entry_close_position: float,
 ) -> dict[str, object]:
     net_returns = trades["net_return"] if not trades.empty else pd.Series(dtype=float)
     gross_returns = trades["gross_return"] if not trades.empty else pd.Series(dtype=float)
@@ -199,6 +328,13 @@ def calculate_metrics(
     gross_final = float((1 + gross_returns).prod()) if not gross_returns.empty else 1.0
     net_final = float(curve["equity"].iloc[-1])
     holding_bars = trades["holding_bars"] if not trades.empty else pd.Series(dtype=float)
+    confirmation_candidates = candidate_signals - incomplete_horizon_signals
+    entry_confirmation_passed = (
+        confirmation_candidates
+        - entry_confirmation_rejected
+        - overlapping_signals_skipped
+    )
+    actionable_signals = entry_confirmation_passed
     return {
         "period_start": curve["datetime"].iloc[0].isoformat(),
         "period_end": curve["datetime"].iloc[-1].isoformat(),
@@ -210,9 +346,26 @@ def calculate_metrics(
             / ((1 - fee_rate) * (1 - slippage_rate))
             - 1
         ),
+        "max_entry_upper_wick_ratio": max_entry_upper_wick_ratio,
+        "min_entry_close_position": min_entry_close_position,
         "candidate_signals": candidate_signals,
+        "incomplete_horizon_signals": incomplete_horizon_signals,
+        "entry_confirmation_rejected": entry_confirmation_rejected,
+        "entry_confirmation_passed": entry_confirmation_passed,
+        "entry_confirmation_rejection_rate": (
+            entry_confirmation_rejected / confirmation_candidates
+            if confirmation_candidates
+            else 0.0
+        ),
+        "actionable_signals": actionable_signals,
         "executed_trades": int(len(trades)),
-        "skipped_overlapping_signals": candidate_signals - int(len(trades)),
+        "skipped_overlapping_signals": overlapping_signals_skipped,
+        "signal_accounting_total": (
+            incomplete_horizon_signals
+            + entry_confirmation_rejected
+            + overlapping_signals_skipped
+            + int(len(trades))
+        ),
         "total_return": net_final - 1,
         "gross_compound_return": gross_final - 1,
         "cost_drag_on_equity": gross_final - net_final,
@@ -248,7 +401,11 @@ def base_layout(figure: go.Figure, height: int) -> None:
     figure.update_yaxes(gridcolor=COLORS["grid"], zeroline=False)
 
 
-def build_overview(curve: pd.DataFrame, trades: pd.DataFrame) -> go.Figure:
+def build_overview(
+    curve: pd.DataFrame,
+    trades: pd.DataFrame,
+    rejections: pd.DataFrame,
+) -> go.Figure:
     display = (
         curve.set_index("datetime")
         .resample("1h")
@@ -327,6 +484,8 @@ def build_overview(curve: pd.DataFrame, trades: pd.DataFrame) -> go.Figure:
                 trades["score"].to_numpy(),
                 trades["volume_ratio"].to_numpy(),
                 trades["compression_ratio"].to_numpy(),
+                trades["confirmation_upper_wick_ratio"].to_numpy(),
+                trades["confirmation_close_position"].to_numpy(),
             ]
         )
         figure.add_trace(
@@ -340,12 +499,43 @@ def build_overview(curve: pd.DataFrame, trades: pd.DataFrame) -> go.Figure:
                 hovertemplate=(
                     "买入=%{x|%Y-%m-%d %H:%M}<br>价格=%{y:.2f}<br>"
                     "本笔净收益=%{customdata[0]:.3%}<br>评分=%{customdata[1]:.4f}<br>"
-                    "量比=%{customdata[2]:.2f}<br>压缩比=%{customdata[3]:.3f}<extra></extra>"
+                    "量比=%{customdata[2]:.2f}<br>压缩比=%{customdata[3]:.3f}<br>"
+                    "确认上影线=%{customdata[4]:.1%}<br>确认收盘位置=%{customdata[5]:.1%}<extra></extra>"
                 ),
             ),
             row=3,
             col=1,
         )
+    if not rejections.empty:
+        rejection_text = rejections.apply(
+            lambda row: (
+                f"确认拒绝={row['confirmation_time']:%Y-%m-%d %H:%M}<br>"
+                f"价格={row['confirmation_price']:.2f}<br>"
+                f"上影线/振幅={row['confirmation_upper_wick_ratio']:.1%}<br>"
+                f"收盘位置={row['confirmation_close_position']:.1%}<br>"
+                f"原因={row['reason']}"
+            ),
+            axis=1,
+        )
+        figure.add_trace(
+            go.Scattergl(
+                x=rejections["confirmation_time"],
+                y=rejections["confirmation_price"],
+                mode="markers",
+                name="确认拒绝",
+                marker={
+                    "symbol": "x",
+                    "size": 8,
+                    "color": COLORS["loss"],
+                    "line": {"width": 1.5, "color": COLORS["loss"]},
+                },
+                text=rejection_text,
+                hovertemplate="%{text}<extra></extra>",
+            ),
+            row=3,
+            col=1,
+        )
+    if not trades.empty:
         figure.add_trace(
             go.Scattergl(
                 x=trades["exit_time"],
@@ -570,6 +760,37 @@ def build_trade_detail(
         group.append(len(figure.data) - 1)
         figure.add_trace(
             go.Scatter(
+                x=[trade["confirmation_time"]],
+                y=[trade["confirmation_price"]],
+                mode="markers+text",
+                text=["确认"],
+                textposition="top center",
+                marker={
+                    "symbol": "diamond",
+                    "size": 11,
+                    "color": COLORS["benchmark"],
+                    "line": {"color": "#ffffff", "width": 1},
+                },
+                visible=visible,
+                showlegend=False,
+                customdata=[
+                    [
+                        trade["confirmation_upper_wick_ratio"],
+                        trade["confirmation_close_position"],
+                    ]
+                ],
+                hovertemplate=(
+                    "确认时间=%{x|%Y-%m-%d %H:%M}<br>确认收盘=%{y:.2f}<br>"
+                    "上影线/振幅=%{customdata[0]:.1%}<br>"
+                    "收盘位置=%{customdata[1]:.1%}<extra></extra>"
+                ),
+            ),
+            row=1,
+            col=1,
+        )
+        group.append(len(figure.data) - 1)
+        figure.add_trace(
+            go.Scatter(
                 x=[trade["entry_time"], trade["exit_time"]],
                 y=[trade["entry_price"], trade["exit_price"]],
                 mode="markers+text",
@@ -609,9 +830,9 @@ def build_trade_detail(
         group.append(len(figure.data) - 1)
         trace_groups.append(group)
         titles.append(
-            f"代表交易 {display_number}/{len(selected)} | {pd.Timestamp(trade['signal_time']):%Y-%m-%d %H:%M} | "
-            f"净收益 {trade['net_return']:.3%} | 评分 {trade['score']:.4f} | "
-            f"量比 {trade['volume_ratio']:.2f} | 压缩比 {trade['compression_ratio']:.3f}"
+            f"代表交易 {display_number}/{len(selected)} | 信号 {pd.Timestamp(trade['signal_time']):%Y-%m-%d %H:%M} | "
+            f"确认 {pd.Timestamp(trade['confirmation_time']):%H:%M} | 开仓 {pd.Timestamp(trade['entry_time']):%H:%M} | "
+            f"净收益 {trade['net_return']:.3%} | 上影线 {trade['confirmation_upper_wick_ratio']:.1%}"
         )
         x_ranges.append([window["datetime"].iloc[0], window["datetime"].iloc[-1]])
         visible_prices = pd.concat(
@@ -710,10 +931,13 @@ def trade_table_html(trades: pd.DataFrame) -> str:
         [
             "trade",
             "signal_time",
+            "confirmation_time",
             "entry_time",
             "exit_time",
             "holding_bars",
             "net_return",
+            "confirmation_upper_wick_ratio",
+            "confirmation_close_position",
             "score",
             "compression_ratio",
             "volume_ratio",
@@ -726,10 +950,13 @@ def trade_table_html(trades: pd.DataFrame) -> str:
     display.columns = [
         "交易",
         "信号时间",
+        "确认时间",
         "买入时间",
         "卖出时间",
         "持仓分钟",
         "净收益",
+        "确认上影线/振幅",
+        "确认收盘位置",
         "评分",
         "压缩比",
         "量比",
@@ -738,9 +965,9 @@ def trade_table_html(trades: pd.DataFrame) -> str:
         "MAE",
         "交易后净值",
     ]
-    for column in ["信号时间", "买入时间", "卖出时间"]:
+    for column in ["信号时间", "确认时间", "买入时间", "卖出时间"]:
         display[column] = pd.to_datetime(display[column]).dt.strftime("%Y-%m-%d %H:%M")
-    for column in ["净收益", "MFE", "MAE"]:
+    for column in ["净收益", "确认上影线/振幅", "确认收盘位置", "MFE", "MAE"]:
         display[column] = display[column].map(lambda value: f"{value:.3%}")
     for column in ["评分", "压缩比", "突破强度"]:
         display[column] = display[column].map(lambda value: f"{value:.4f}")
@@ -749,10 +976,50 @@ def trade_table_html(trades: pd.DataFrame) -> str:
     return display.to_html(index=False, classes="trade-table", border=0, escape=True)
 
 
+def rejection_table(rejections: pd.DataFrame) -> str:
+    if rejections.empty:
+        return "<p class='empty'>没有被确认规则拒绝的信号。</p>"
+    display = rejections.sort_values("confirmation_time", ascending=False).copy()
+    display = display[
+        [
+            "signal_time",
+            "confirmation_time",
+            "entry_time",
+            "entry_price",
+            "confirmation_price",
+            "confirmation_upper_wick_ratio",
+            "confirmation_close_position",
+            "breakout_level",
+            "reason",
+        ]
+    ]
+    display.columns = [
+        "信号时间",
+        "确认时间",
+        "原计划开仓时间",
+        "原计划开仓价",
+        "确认收盘价",
+        "确认上影线/振幅",
+        "确认收盘位置",
+        "突破位",
+        "拒绝原因",
+    ]
+    for column in ["信号时间", "确认时间", "原计划开仓时间"]:
+        display[column] = pd.to_datetime(display[column]).dt.strftime("%Y-%m-%d %H:%M")
+    for column in ["确认上影线/振幅", "确认收盘位置"]:
+        display[column] = display[column].map(lambda value: f"{value:.3%}")
+    for column in ["原计划开仓价", "确认收盘价", "突破位"]:
+        display[column] = display[column].map(
+            lambda value: "" if pd.isna(value) else f"{value:.2f}"
+        )
+    return display.to_html(index=False, classes="trade-table", border=0, escape=True)
+
+
 def write_outputs(
     output_dir: Path,
     curve: pd.DataFrame,
     trades: pd.DataFrame,
+    rejections: pd.DataFrame,
     metrics: dict[str, object],
     overview: go.Figure,
     diagnostics: go.Figure,
@@ -760,6 +1027,7 @@ def write_outputs(
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     trades.to_csv(output_dir / TRADES_NAME, index=False)
+    rejections.to_csv(output_dir / REJECTIONS_NAME, index=False)
     curve.to_csv(output_dir / EQUITY_NAME, index=False)
     (output_dir / METRICS_NAME).write_text(
         json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -786,6 +1054,7 @@ def write_outputs(
         verdict_class = "bad"
         verdict = "当前参数没有形成正向样本外收益，图表用于诊断而不是证明策略有效。"
     table_html = trade_table_html(trades)
+    rejection_table_html = rejection_table(rejections)
     break_even = float(metrics["round_trip_break_even_return"])
     meta = (
         f"单边手续费 {float(metrics['fee_rate_per_side']):.2%}，单边滑点 "
@@ -836,11 +1105,12 @@ h1 {{ margin:0; font-size:28px; line-height:1.25; letter-spacing:0; }}
 <section class="metrics">{metric_cards(metrics)}</section>
 <div class="verdict {verdict_class}">{verdict}</div>
 <p class="report-meta">{meta}</p>
-<nav class="toolbar"><a href="{TRADES_NAME}">交易明细 CSV</a><a href="{EQUITY_NAME}">净值曲线 CSV</a><a href="{METRICS_NAME}">指标 JSON</a></nav>
+<nav class="toolbar"><a href="{TRADES_NAME}">成交明细 CSV</a><a href="{REJECTIONS_NAME}">拒绝信号 CSV</a><a href="{EQUITY_NAME}">净值曲线 CSV</a><a href="{METRICS_NAME}">指标 JSON</a></nav>
 <section class="panel">{overview_html}</section>
 <section class="panel"><div class="section-head"><h2>收益与因子诊断</h2><span>收益均已计入双边手续费与滑点</span></div>{diagnostics_html}</section>
 <section class="panel"><div class="section-head"><h2>代表交易 K 线</h2><span>下拉切换最好、最差及最近交易</span></div>{detail_html}</section>
 <section class="panel"><div class="section-head"><h2>全部交易明细</h2><span>共 {len(trades):,} 笔</span></div><div class="table-wrap">{table_html}</div></section>
+<section class="panel"><div class="section-head"><h2>确认拒绝信号</h2><span>共 {len(rejections):,} 笔，包含长上影和收盘位置不合格信号</span></div><div class="table-wrap">{rejection_table_html}</div></section>
 </main></body></html>"""
     report_path.write_text(html, encoding="utf-8")
     return report_path
@@ -852,6 +1122,10 @@ def main() -> None:
         raise ValueError("horizon-bars, context-bars and detail-trades must be positive")
     if not 0 <= args.fee_rate < 1 or not 0 <= args.slippage_rate < 1:
         raise ValueError("fee-rate and slippage-rate must be in [0, 1)")
+    if not 0 <= args.max_entry_upper_wick_ratio <= 1:
+        raise ValueError("max-entry-upper-wick-ratio must be in [0, 1]")
+    if not 0 <= args.min_entry_close_position <= 1:
+        raise ValueError("min-entry-close-position must be in [0, 1]")
 
     factor_module = load_factor_module()
     start_time = pd.Timestamp(args.start)
@@ -865,7 +1139,14 @@ def main() -> None:
     if end_time <= start_time:
         raise ValueError("end must be later than start")
     features, _ = factor_module.make_dataset(data, args.horizon_bars)
-    trades, candidate_signals = select_non_overlapping_trades(
+    (
+        trades,
+        candidate_signals,
+        incomplete_horizon_signals,
+        entry_confirmation_rejected,
+        overlapping_signals_skipped,
+        rejections,
+    ) = select_non_overlapping_trades(
         data,
         features,
         start_time,
@@ -873,6 +1154,8 @@ def main() -> None:
         args.horizon_bars,
         args.fee_rate,
         args.slippage_rate,
+        args.max_entry_upper_wick_ratio,
+        args.min_entry_close_position,
     )
     curve = build_equity_curve(
         data, trades, start_time, end_time, args.fee_rate, args.slippage_rate
@@ -881,15 +1164,27 @@ def main() -> None:
         curve,
         trades,
         candidate_signals,
+        incomplete_horizon_signals,
+        entry_confirmation_rejected,
+        overlapping_signals_skipped,
         args.fee_rate,
         args.slippage_rate,
         args.horizon_bars,
+        args.max_entry_upper_wick_ratio,
+        args.min_entry_close_position,
     )
-    overview = build_overview(curve, trades)
+    overview = build_overview(curve, trades, rejections)
     diagnostics = build_diagnostics(trades)
     detail = build_trade_detail(data, trades, args.context_bars, args.detail_trades)
     report_path = write_outputs(
-        args.output_dir, curve, trades, metrics, overview, diagnostics, detail
+        args.output_dir,
+        curve,
+        trades,
+        rejections,
+        metrics,
+        overview,
+        diagnostics,
+        detail,
     )
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
     print(f"Interactive report: {report_path.resolve()}")
